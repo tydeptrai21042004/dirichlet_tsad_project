@@ -140,16 +140,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--methods", nargs="+", default=["proposed_dirichlet"], choices=sorted(AVAILABLE_METHODS.keys()))
     parser.add_argument("--output-dir", type=str, default=default_output_dir())
     parser.add_argument("--target-index", type=int, default=0)
+    parser.add_argument("--force-target-only", action="store_true", help="Use only target_index for every method for fair target-only comparison")
 
-    # Better defaults for your paper-like Dirichlet setup
     parser.add_argument("--threshold-mode", type=str, default="alert_budget_under", choices=["fixed_quantile", "alert_budget_under", "alert_budget_closest"])
     parser.add_argument("--threshold-q", type=float, default=0.995)
-    parser.add_argument("--alert-budget", type=float, default=0.005)
+    parser.add_argument("--alert-budget", type=float, default=0.10)
     parser.add_argument("--train-fraction", type=float, default=0.30)
-    parser.add_argument("--threshold-warmup", type=int, default=-1, help="Calibration warmup. -1 = choose per method.")
-    parser.add_argument("--persistence", type=int, default=3)
-    parser.add_argument("--refractory", type=int, default=0, help="True refractory suppression in samples.")
-    parser.add_argument("--bridge-gap", type=int, default=0, help="Merge nearby positive runs when the gap is this small.")
+    parser.add_argument("--threshold-warmup", type=int, default=-1, help="Warmup length ignored during threshold calibration. -1 = method-aware automatic warmup")
+    parser.add_argument("--persistence", type=int, default=2)
+    parser.add_argument("--refractory", type=int, default=0, help="True refractory suppression after an alarm run")
+    parser.add_argument("--bridge-gap", type=int, default=0, help="Merge nearby alarm runs if the gap length is <= bridge-gap")
 
     parser.add_argument("--alpha", type=float, default=50.0)
     parser.add_argument("--kappa", type=float, default=0.5)
@@ -158,8 +158,6 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--window-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=12)
-    parser.add_argument("--if-contamination", type=float, default=0.01)
-    parser.add_argument("--force-target-only", action="store_true", help="Use only target_index for every method for fair univariate comparison.")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--latent-dim", type=int, default=16)
@@ -170,25 +168,6 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(skip_errors=True)
 
     return parser.parse_args()
-
-
-def _method_threshold_warmup(method: str, args: argparse.Namespace) -> int:
-    if args.threshold_warmup >= 0:
-        return int(args.threshold_warmup)
-
-    if method in {"pca", "isolation_forest", "autoencoder", "lstm_forecast", "moving_average"}:
-        return int(args.window_size)
-    if method == "proposed_dirichlet":
-        lags = parse_int_list(args.lags)
-        return max(lags) if lags else 0
-    return 0
-
-
-def _maybe_target_only(x: np.ndarray, target_index: int, enabled: bool) -> np.ndarray:
-    if not enabled or x.ndim != 2 or x.shape[1] <= 1:
-        return x
-    idx = min(max(int(target_index), 0), x.shape[1] - 1)
-    return x[:, [idx]]
 
 
 def detector_kwargs(method: str, args: argparse.Namespace) -> Dict:
@@ -214,7 +193,7 @@ def detector_kwargs(method: str, args: argparse.Namespace) -> Dict:
     if method == "pca":
         return {**common, "window_size": args.window_size, "n_components": 0.95}
     if method == "isolation_forest":
-        return {**common, "window_size": args.window_size, "contamination": args.if_contamination}
+        return {**common, "window_size": args.window_size, "contamination": max(args.alert_budget, 1e-3)}
     if method == "autoencoder":
         return {
             **common,
@@ -238,6 +217,28 @@ def detector_kwargs(method: str, args: argparse.Namespace) -> Dict:
     raise KeyError(method)
 
 
+def maybe_target_only(x: np.ndarray, target_index: int, enabled: bool) -> np.ndarray:
+    if not enabled:
+        return x
+    if x.ndim != 2:
+        return x
+    if x.shape[1] <= 1:
+        return x
+    return x[:, [target_index]]
+
+
+def method_threshold_warmup(method: str, args: argparse.Namespace) -> int:
+    if args.threshold_warmup >= 0:
+        return int(args.threshold_warmup)
+
+    if method in {"pca", "isolation_forest", "autoencoder", "lstm_forecast", "moving_average"}:
+        return int(args.window_size)
+    if method == "proposed_dirichlet":
+        lags = parse_int_list(args.lags)
+        return int(max(lags) if len(lags) > 0 else 0)
+    return 0
+
+
 def main() -> None:
     args = parse_args()
     args.data_dir = resolve_data_dir(args.data_dir)
@@ -251,12 +252,19 @@ def main() -> None:
     print("[INFO] Force target-only:", args.force_target_only)
 
     dataset = TelemanomDataset(args.data_dir, target_index=args.target_index)
-
     aggregate_rows: List[AggregateMetrics] = []
 
     for method in args.methods:
         method_dir = out_root / method
         method_dir.mkdir(parents=True, exist_ok=True)
+
+        threshold_cfg = ThresholdConfig(
+            mode=args.threshold_mode,
+            q=args.threshold_q,
+            beta=args.alert_budget,
+            train_fraction=args.train_fraction,
+            warmup=method_threshold_warmup(method, args),
+        )
 
         channel_rows = []
         y_true_all = []
@@ -268,15 +276,8 @@ def main() -> None:
         for record in dataset.iter_channels(spacecraft=args.spacecraft):
             try:
                 detector = build_detector(method, **detector_kwargs(method, args))
-                train_x = _maybe_target_only(record.train, args.target_index, args.force_target_only)
-                test_x = _maybe_target_only(record.test, args.target_index, args.force_target_only)
-                threshold_cfg = ThresholdConfig(
-                    mode=args.threshold_mode,
-                    q=args.threshold_q,
-                    beta=args.alert_budget,
-                    train_fraction=args.train_fraction,
-                    warmup=_method_threshold_warmup(method, args),
-                )
+                train_x = maybe_target_only(record.train, args.target_index, args.force_target_only)
+                test_x = maybe_target_only(record.test, args.target_index, args.force_target_only)
 
                 t0 = time.perf_counter()
                 detector.fit(train_x)
@@ -311,7 +312,10 @@ def main() -> None:
                         "fit_and_score_seconds": fit_time,
                         "train_length": len(record.train),
                         "test_length": len(record.test),
-                        "n_features": int(train_x.shape[1]),
+                        "n_features_original": int(record.train.shape[1]),
+                        "n_features_used": int(train_x.shape[1]) if train_x.ndim == 2 else 1,
+                        "force_target_only": bool(args.force_target_only),
+                        "threshold_warmup": int(threshold_cfg.warmup),
                     }
                 )
 

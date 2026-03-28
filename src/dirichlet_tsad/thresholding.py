@@ -1,49 +1,39 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
 import numpy as np
-
-ThresholdMode = Literal[
-    "fixed_quantile",
-    "alert_budget_under",
-    "alert_budget_closest",
-]
 
 
 @dataclass
 class ThresholdConfig:
-    mode: ThresholdMode = "alert_budget_under"
+    mode: str = "fixed_quantile"
     q: float = 0.995
-    beta: float = 0.10
+    beta: float = 0.01
     train_fraction: float = 0.30
-    warmup: int = 0  # ignore unstable first scores during calibration
+    warmup: int = 0
 
 
-def choose_threshold(scores: np.ndarray, config: ThresholdConfig) -> float:
-    scores = np.asarray(scores, dtype=np.float32)
-    scores = scores[np.isfinite(scores)]
+def choose_threshold(train_scores: np.ndarray, config: ThresholdConfig) -> float:
+    scores = np.asarray(train_scores, dtype=np.float32)
     if len(scores) == 0:
         return 0.0
 
-    end = max(1, int(len(scores) * config.train_fraction))
-    start = min(max(int(config.warmup), 0), max(end - 1, 0))
-
+    start = max(0, int(config.warmup))
+    end = max(start + 1, int(np.ceil(len(scores) * float(config.train_fraction))))
+    end = min(end, len(scores))
     subset = scores[start:end]
     if len(subset) == 0:
-        subset = scores[:end]
-    if len(subset) == 0:
-        return 0.0
+        subset = scores
 
     if config.mode == "fixed_quantile":
         return float(np.quantile(subset, config.q))
 
     unique_scores = np.unique(subset)
-    if len(unique_scores) == 1:
-        return float(unique_scores[0])
+    unique_scores = np.sort(unique_scores)[::-1]
+    if len(unique_scores) == 0:
+        return float(np.max(subset))
 
-    # rates decrease as threshold increases
     rates = np.asarray([(subset > thr).mean() for thr in unique_scores], dtype=np.float32)
 
     if config.mode == "alert_budget_under":
@@ -91,7 +81,7 @@ def apply_postprocessing(
                 out[s : e + 1] = 1
         pred = out
 
-    # Step 2: optionally bridge small gaps between runs
+    # Step 2: merge nearby runs if the gap is small
     if bridge_gap > 0:
         starts, ends = _find_runs(pred)
         if len(starts) > 1:
@@ -104,19 +94,13 @@ def apply_postprocessing(
                 cur_e = e
             pred = out
 
-    # Step 3: true refractory suppression: keep the first run, suppress runs that
-    # re-trigger too soon after the previous kept run has ended.
+    # Step 3: true refractory suppression after each positive run
     if refractory > 0:
         starts, ends = _find_runs(pred)
-        if len(starts) > 1:
-            out = np.zeros(n, dtype=np.int32)
-            keep_s, keep_e = starts[0], ends[0]
-            out[keep_s : keep_e + 1] = 1
-            for s, e in zip(starts[1:], ends[1:]):
-                gap = s - keep_e - 1
-                if gap > refractory:
-                    out[s : e + 1] = 1
-                    keep_s, keep_e = s, e
-            pred = out
+        out = pred.copy()
+        for e in ends:
+            sup_end = min(n, e + 1 + int(refractory))
+            out[e + 1 : sup_end] = 0
+        pred = out
 
     return pred.astype(np.int32)
