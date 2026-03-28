@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -22,35 +24,153 @@ from src.dirichlet_tsad.thresholding import ThresholdConfig, apply_postprocessin
 from src.dirichlet_tsad.utils import parse_int_list
 
 
+DEFAULT_KAGGLE_DATASET = Path("/kaggle/input/datasets/patrickfleith/nasa-anomaly-detection-dataset-smap-msl")
+DEFAULT_KAGGLE_OUTPUT = Path("/kaggle/working/results")
+DEFAULT_KAGGLE_WRAPPER = Path("/kaggle/working/telemanom_root")
+
+
+def default_output_dir() -> str:
+    if DEFAULT_KAGGLE_OUTPUT.parent.exists():
+        return str(DEFAULT_KAGGLE_OUTPUT)
+    return "outputs"
+
+
+def _canonical_root_ready(root: Path) -> bool:
+    return (
+        root.exists()
+        and (root / "labeled_anomalies.csv").exists()
+        and (root / "train").is_dir()
+        and (root / "test").is_dir()
+    )
+
+
+def _discover_telemanom_parts(raw_root: Path) -> Tuple[Path, Path, Path]:
+    raw_root = raw_root.resolve()
+
+    # Already in canonical format
+    if _canonical_root_ready(raw_root):
+        return raw_root / "labeled_anomalies.csv", raw_root / "train", raw_root / "test"
+
+    # Kaggle dataset layout known in this conversation
+    csv_path = raw_root / "labeled_anomalies.csv"
+    train_dir = raw_root / "data" / "data" / "train"
+    test_dir = raw_root / "data" / "data" / "test"
+    if csv_path.exists() and train_dir.is_dir() and test_dir.is_dir():
+        return csv_path, train_dir, test_dir
+
+    # Fallback search
+    csv_candidates = sorted(raw_root.rglob("labeled_anomalies.csv"))
+    for csv in csv_candidates:
+        parent = csv.parent
+        if (parent / "train").is_dir() and (parent / "test").is_dir():
+            return csv, parent / "train", parent / "test"
+        if (parent / "data" / "data" / "train").is_dir() and (parent / "data" / "data" / "test").is_dir():
+            return csv, parent / "data" / "data" / "train", parent / "data" / "data" / "test"
+
+    raise FileNotFoundError(
+        f"Could not find a Telemanom dataset layout under: {raw_root}\n"
+        f"Expected either:\n"
+        f"  root/labeled_anomalies.csv + root/train + root/test\n"
+        f"or Kaggle layout:\n"
+        f"  root/labeled_anomalies.csv + root/data/data/train + root/data/data/test"
+    )
+
+
+def _link_or_copy(src: Path, dst: Path) -> None:
+    if dst.exists() or dst.is_symlink():
+        return
+    try:
+        os.symlink(src, dst, target_is_directory=src.is_dir())
+    except Exception:
+        if src.is_dir():
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+
+
+def prepare_telemanom_root(raw_root: Path, prepared_root: Path | None = None) -> Path:
+    raw_root = raw_root.resolve()
+
+    # If already canonical, use directly
+    if _canonical_root_ready(raw_root):
+        return raw_root
+
+    csv_src, train_src, test_src = _discover_telemanom_parts(raw_root)
+
+    if prepared_root is None:
+        if DEFAULT_KAGGLE_WRAPPER.parent.exists():
+            prepared_root = DEFAULT_KAGGLE_WRAPPER
+        else:
+            prepared_root = Path.cwd() / ".telemanom_root"
+
+    prepared_root = prepared_root.resolve()
+    prepared_root.mkdir(parents=True, exist_ok=True)
+
+    csv_dst = prepared_root / "labeled_anomalies.csv"
+    train_dst = prepared_root / "train"
+    test_dst = prepared_root / "test"
+
+    if not csv_dst.exists():
+        shutil.copy2(csv_src, csv_dst)
+    _link_or_copy(train_src, train_dst)
+    _link_or_copy(test_src, test_dst)
+
+    if not _canonical_root_ready(prepared_root):
+        raise RuntimeError(f"Prepared dataset root is incomplete: {prepared_root}")
+
+    return prepared_root
+
+
+def resolve_data_dir(user_value: str | None) -> str:
+    if user_value is not None:
+        return str(prepare_telemanom_root(Path(user_value)))
+
+    if DEFAULT_KAGGLE_DATASET.exists():
+        return str(prepare_telemanom_root(DEFAULT_KAGGLE_DATASET))
+
+    raise FileNotFoundError(
+        "No --data-dir was provided and the default Kaggle dataset path was not found."
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark Dirichlet TSAD and baselines on SMAP/MSL.")
-    parser.add_argument("--data-dir", type=str, required=True, help="Path to Telemanom-format data folder")
+    parser.add_argument("--data-dir", type=str, default=None, help="Path to raw or Telemanom-format data folder")
     parser.add_argument("--spacecraft", type=str, default="both", choices=["SMAP", "MSL", "both"], help="Subset to evaluate")
     parser.add_argument("--methods", nargs="+", default=["proposed_dirichlet"], choices=sorted(AVAILABLE_METHODS.keys()))
-    parser.add_argument("--output-dir", type=str, default="outputs")
+    parser.add_argument("--output-dir", type=str, default=default_output_dir())
     parser.add_argument("--target-index", type=int, default=0)
-    parser.add_argument("--threshold-mode", type=str, default="alert_budget_under", choices=["fixed_quantile", "alert_budget_under", "alert_budget_closest"])
+
+    # Better defaults for your paper-like Dirichlet setup
+    parser.add_argument("--threshold-mode", type=str, default="alert_budget_closest", choices=["fixed_quantile", "alert_budget_under", "alert_budget_closest"])
     parser.add_argument("--threshold-q", type=float, default=0.995)
-    parser.add_argument("--alert-budget", type=float, default=0.005)
+    parser.add_argument("--alert-budget", type=float, default=0.3052)
     parser.add_argument("--train-fraction", type=float, default=0.30)
     parser.add_argument("--persistence", type=int, default=1)
     parser.add_argument("--refractory", type=int, default=0)
+
     parser.add_argument("--alpha", type=float, default=50.0)
     parser.add_argument("--kappa", type=float, default=0.5)
     parser.add_argument("--lags", type=str, default="1")
     parser.add_argument("--norm-window", type=int, default=256)
+
     parser.add_argument("--window-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--latent-dim", type=int, default=16)
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--skip-errors", action="store_true")
+
+    parser.add_argument("--skip-errors", dest="skip_errors", action="store_true", help="Skip failed channels/methods")
+    parser.add_argument("--strict-errors", dest="skip_errors", action="store_false", help="Stop on the first error")
+    parser.set_defaults(skip_errors=True)
+
     return parser.parse_args()
 
 
 def detector_kwargs(method: str, args: argparse.Namespace) -> Dict:
     common = {"normalize": True}
+
     if method == "proposed_dirichlet":
         return {
             **common,
@@ -97,8 +217,14 @@ def detector_kwargs(method: str, args: argparse.Namespace) -> Dict:
 
 def main() -> None:
     args = parse_args()
+    args.data_dir = resolve_data_dir(args.data_dir)
+
     out_root = Path(args.output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
+
+    print("[INFO] Using data root :", args.data_dir)
+    print("[INFO] Using output dir:", out_root.resolve())
+    print("[INFO] Spacecraft      :", args.spacecraft)
 
     dataset = TelemanomDataset(args.data_dir, target_index=args.target_index)
     threshold_cfg = ThresholdConfig(
@@ -113,14 +239,18 @@ def main() -> None:
     for method in args.methods:
         method_dir = out_root / method
         method_dir.mkdir(parents=True, exist_ok=True)
+
         channel_rows = []
         y_true_all = []
         y_pred_all = []
         runtime_rows = []
 
+        print(f"[INFO] Running method: {method}")
+
         for record in dataset.iter_channels(spacecraft=args.spacecraft):
             try:
                 detector = build_detector(method, **detector_kwargs(method, args))
+
                 t0 = time.perf_counter()
                 detector.fit(record.train)
                 train_scores = detector.score(record.train)
@@ -160,6 +290,7 @@ def main() -> None:
                         "label": record.labels,
                     }
                 ).to_csv(method_dir / f"{record.channel_id}_scores.csv", index=False)
+
             except Exception as exc:
                 if args.skip_errors:
                     print(f"[WARN] {method} / {record.channel_id} failed: {exc}")
@@ -169,6 +300,7 @@ def main() -> None:
         ch_df = channel_metrics_to_frame(channel_rows)
         ch_df.to_csv(method_dir / "channel_metrics.csv", index=False)
         pd.DataFrame(runtime_rows).to_csv(method_dir / "runtime.csv", index=False)
+
         agg = aggregate_metrics(method, args.spacecraft, channel_rows, y_true_all, y_pred_all)
         aggregate_rows.append(agg)
 
