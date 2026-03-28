@@ -140,11 +140,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--methods", nargs="+", default=["proposed_dirichlet"], choices=sorted(AVAILABLE_METHODS.keys()))
     parser.add_argument("--output-dir", type=str, default=default_output_dir())
     parser.add_argument("--target-index", type=int, default=0)
-    parser.add_argument("--force-target-only", action="store_true", help="Use only target_index for every method for fair target-only comparison")
+    parser.add_argument("--force-target-only", action=argparse.BooleanOptionalAction, default=True, help="Use only target_index for every method for fair target-only comparison")
 
     parser.add_argument("--threshold-mode", type=str, default="alert_budget_under", choices=["fixed_quantile", "alert_budget_under", "alert_budget_closest"])
     parser.add_argument("--threshold-q", type=float, default=0.995)
-    parser.add_argument("--alert-budget", type=float, default=0.10)
+    parser.add_argument("--alert-budget", type=float, default=0.005)
     parser.add_argument("--train-fraction", type=float, default=0.30)
     parser.add_argument("--threshold-warmup", type=int, default=-1, help="Warmup length ignored during threshold calibration. -1 = method-aware automatic warmup")
     parser.add_argument("--persistence", type=int, default=2)
