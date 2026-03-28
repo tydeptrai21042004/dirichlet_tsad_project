@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Tuple
-
 import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
@@ -32,7 +29,7 @@ class PCADetector(BaseDetector):
     def _score_impl(self, series: np.ndarray) -> np.ndarray:
         windows, _, end_pos = make_windows(series, self.window_size, horizon=1, stride=1)
         X = windows.reshape(len(windows), -1).astype(np.float32)
-        if self.model_ is None:
+        if getattr(self, 'model_', None) is None:
             return np.zeros(len(series), dtype=np.float32)
         recon = self.model_.inverse_transform(self.model_.transform(X))
         errs = np.mean((X - recon) ** 2, axis=1)
@@ -43,7 +40,7 @@ class PCADetector(BaseDetector):
 class IsolationForestDetector(BaseDetector):
     name = "isolation_forest"
 
-    def __init__(self, window_size: int = 32, contamination: float = 0.05, normalize: bool = True):
+    def __init__(self, window_size: int = 32, contamination: float = 0.01, normalize: bool = True):
         super().__init__(normalize=normalize)
         self.window_size = int(window_size)
         self.contamination = float(contamination)

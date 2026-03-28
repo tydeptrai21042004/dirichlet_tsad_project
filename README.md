@@ -354,3 +354,15 @@ python tests/smoke_test.py
 ```
 
 If the smoke test passes, the basic project wiring is working.
+
+
+## Upgraded proposed_dirichlet
+
+The default `proposed_dirichlet` detector now uses:
+- two-scale Dirichlet backgrounds (`alpha` and `alpha_fast_ratio * alpha`)
+- signed onset scoring from antisymmetric residual differences
+- sustain confirmation from causal residual energy
+- shape coherence weighting
+- hysteresis thresholding and cleaner postprocessing
+
+The benchmark also reports extra metrics including ROC-AUC, PR-AUC, EarlyHit@5/10/20, mean delay, P90 delay, false-alarm segments per 1k points, and mean predicted segment length.

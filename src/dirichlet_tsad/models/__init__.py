@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Dict, Sequence
-
 from .dirichlet import DirichletResidualDetector
 from .smoothing import EWMADetector, MovingAverageResidualDetector, PeriodicFFTResidualDetector
 from .spectral_residual import SpectralResidualDetector
