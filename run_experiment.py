@@ -142,12 +142,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-index", type=int, default=0)
 
     # Better defaults for your paper-like Dirichlet setup
-    parser.add_argument("--threshold-mode", type=str, default="alert_budget_closest", choices=["fixed_quantile", "alert_budget_under", "alert_budget_closest"])
+    parser.add_argument("--threshold-mode", type=str, default="alert_budget_under", choices=["fixed_quantile", "alert_budget_under", "alert_budget_closest"])
     parser.add_argument("--threshold-q", type=float, default=0.995)
-    parser.add_argument("--alert-budget", type=float, default=0.3052)
+    parser.add_argument("--alert-budget", type=float, default=0.10)
     parser.add_argument("--train-fraction", type=float, default=0.30)
-    parser.add_argument("--persistence", type=int, default=1)
-    parser.add_argument("--refractory", type=int, default=0)
+    parser.add_argument("--persistence", type=int, default=2)
+    parser.add_argument("--refractory", type=int, default=16)
 
     parser.add_argument("--alpha", type=float, default=50.0)
     parser.add_argument("--kappa", type=float, default=0.5)
