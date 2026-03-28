@@ -63,7 +63,6 @@ class TelemanomDataset:
         df = self.meta
         if spacecraft.lower() != "both":
             df = df[df["spacecraft"].astype(str).str.upper() == spacecraft.upper()]
-        # important: keep first appearance order, but remove duplicates like P-2
         return df["channel_id"].astype(str).drop_duplicates().tolist()
 
     def _load_array(self, split: str, channel_id: str) -> np.ndarray:
@@ -81,8 +80,10 @@ class TelemanomDataset:
             value = text
         else:
             value = ast.literal_eval(str(text))
+
         if isinstance(value, tuple):
             value = list(value)
+
         if not isinstance(value, list):
             raise ValueError(f"Invalid anomaly_sequences: {text}")
 
@@ -97,15 +98,17 @@ class TelemanomDataset:
     def _merge_sequences(self, sequences: List[List[int]]) -> List[List[int]]:
         if not sequences:
             return []
+
         sequences = sorted(sequences, key=lambda x: (x[0], x[1]))
         merged = [sequences[0]]
+
         for s, e in sequences[1:]:
             last_s, last_e = merged[-1]
-            # merge overlapping or touching intervals
             if s <= last_e + 1:
                 merged[-1][1] = max(last_e, e)
             else:
                 merged.append([s, e])
+
         return merged
 
     def _make_labels(self, n: int, sequences: List[List[int]]) -> np.ndarray:
