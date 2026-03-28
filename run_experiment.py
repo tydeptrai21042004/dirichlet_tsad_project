@@ -144,10 +144,12 @@ def parse_args() -> argparse.Namespace:
     # Better defaults for your paper-like Dirichlet setup
     parser.add_argument("--threshold-mode", type=str, default="alert_budget_under", choices=["fixed_quantile", "alert_budget_under", "alert_budget_closest"])
     parser.add_argument("--threshold-q", type=float, default=0.995)
-    parser.add_argument("--alert-budget", type=float, default=0.10)
+    parser.add_argument("--alert-budget", type=float, default=0.005)
     parser.add_argument("--train-fraction", type=float, default=0.30)
-    parser.add_argument("--persistence", type=int, default=2)
-    parser.add_argument("--refractory", type=int, default=16)
+    parser.add_argument("--threshold-warmup", type=int, default=-1, help="Calibration warmup. -1 = choose per method.")
+    parser.add_argument("--persistence", type=int, default=3)
+    parser.add_argument("--refractory", type=int, default=0, help="True refractory suppression in samples.")
+    parser.add_argument("--bridge-gap", type=int, default=0, help="Merge nearby positive runs when the gap is this small.")
 
     parser.add_argument("--alpha", type=float, default=50.0)
     parser.add_argument("--kappa", type=float, default=0.5)
@@ -156,6 +158,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--window-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--if-contamination", type=float, default=0.01)
+    parser.add_argument("--force-target-only", action="store_true", help="Use only target_index for every method for fair univariate comparison.")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--latent-dim", type=int, default=16)
@@ -166,6 +170,25 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(skip_errors=True)
 
     return parser.parse_args()
+
+
+def _method_threshold_warmup(method: str, args: argparse.Namespace) -> int:
+    if args.threshold_warmup >= 0:
+        return int(args.threshold_warmup)
+
+    if method in {"pca", "isolation_forest", "autoencoder", "lstm_forecast", "moving_average"}:
+        return int(args.window_size)
+    if method == "proposed_dirichlet":
+        lags = parse_int_list(args.lags)
+        return max(lags) if lags else 0
+    return 0
+
+
+def _maybe_target_only(x: np.ndarray, target_index: int, enabled: bool) -> np.ndarray:
+    if not enabled or x.ndim != 2 or x.shape[1] <= 1:
+        return x
+    idx = min(max(int(target_index), 0), x.shape[1] - 1)
+    return x[:, [idx]]
 
 
 def detector_kwargs(method: str, args: argparse.Namespace) -> Dict:
@@ -191,7 +214,7 @@ def detector_kwargs(method: str, args: argparse.Namespace) -> Dict:
     if method == "pca":
         return {**common, "window_size": args.window_size, "n_components": 0.95}
     if method == "isolation_forest":
-        return {**common, "window_size": args.window_size, "contamination": max(args.alert_budget, 1e-3)}
+        return {**common, "window_size": args.window_size, "contamination": args.if_contamination}
     if method == "autoencoder":
         return {
             **common,
@@ -225,14 +248,9 @@ def main() -> None:
     print("[INFO] Using data root :", args.data_dir)
     print("[INFO] Using output dir:", out_root.resolve())
     print("[INFO] Spacecraft      :", args.spacecraft)
+    print("[INFO] Force target-only:", args.force_target_only)
 
     dataset = TelemanomDataset(args.data_dir, target_index=args.target_index)
-    threshold_cfg = ThresholdConfig(
-        mode=args.threshold_mode,
-        q=args.threshold_q,
-        beta=args.alert_budget,
-        train_fraction=args.train_fraction,
-    )
 
     aggregate_rows: List[AggregateMetrics] = []
 
@@ -250,16 +268,30 @@ def main() -> None:
         for record in dataset.iter_channels(spacecraft=args.spacecraft):
             try:
                 detector = build_detector(method, **detector_kwargs(method, args))
+                train_x = _maybe_target_only(record.train, args.target_index, args.force_target_only)
+                test_x = _maybe_target_only(record.test, args.target_index, args.force_target_only)
+                threshold_cfg = ThresholdConfig(
+                    mode=args.threshold_mode,
+                    q=args.threshold_q,
+                    beta=args.alert_budget,
+                    train_fraction=args.train_fraction,
+                    warmup=_method_threshold_warmup(method, args),
+                )
 
                 t0 = time.perf_counter()
-                detector.fit(record.train)
-                train_scores = detector.score(record.train)
-                test_scores = detector.score(record.test)
+                detector.fit(train_x)
+                train_scores = detector.score(train_x)
+                test_scores = detector.score(test_x)
                 fit_time = time.perf_counter() - t0
 
                 threshold = choose_threshold(train_scores, threshold_cfg)
                 pred = (test_scores > threshold).astype(np.int32)
-                pred = apply_postprocessing(pred, persistence=args.persistence, refractory=args.refractory)
+                pred = apply_postprocessing(
+                    pred,
+                    persistence=args.persistence,
+                    refractory=args.refractory,
+                    bridge_gap=args.bridge_gap,
+                )
 
                 row = evaluate_channel(
                     channel_id=record.channel_id,
@@ -279,7 +311,7 @@ def main() -> None:
                         "fit_and_score_seconds": fit_time,
                         "train_length": len(record.train),
                         "test_length": len(record.test),
-                        "n_features": int(record.train.shape[1]),
+                        "n_features": int(train_x.shape[1]),
                     }
                 )
 

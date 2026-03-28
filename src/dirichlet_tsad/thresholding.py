@@ -75,6 +75,7 @@ def apply_postprocessing(
     pred: np.ndarray,
     persistence: int = 1,
     refractory: int = 0,
+    bridge_gap: int = 0,
 ) -> np.ndarray:
     pred = np.asarray(pred, dtype=np.int32).copy()
     n = len(pred)
@@ -90,19 +91,32 @@ def apply_postprocessing(
                 out[s : e + 1] = 1
         pred = out
 
-    # Step 2: merge nearby runs if the gap is small
-    if refractory > 0:
+    # Step 2: optionally bridge small gaps between runs
+    if bridge_gap > 0:
         starts, ends = _find_runs(pred)
         if len(starts) > 1:
             out = pred.copy()
-            cur_s, cur_e = starts[0], ends[0]
+            cur_e = ends[0]
             for s, e in zip(starts[1:], ends[1:]):
                 gap = s - cur_e - 1
-                if gap <= refractory:
+                if gap <= bridge_gap:
                     out[cur_e + 1 : s] = 1
-                    cur_e = e
-                else:
-                    cur_s, cur_e = s, e
+                cur_e = e
+            pred = out
+
+    # Step 3: true refractory suppression: keep the first run, suppress runs that
+    # re-trigger too soon after the previous kept run has ended.
+    if refractory > 0:
+        starts, ends = _find_runs(pred)
+        if len(starts) > 1:
+            out = np.zeros(n, dtype=np.int32)
+            keep_s, keep_e = starts[0], ends[0]
+            out[keep_s : keep_e + 1] = 1
+            for s, e in zip(starts[1:], ends[1:]):
+                gap = s - keep_e - 1
+                if gap > refractory:
+                    out[s : e + 1] = 1
+                    keep_s, keep_e = s, e
             pred = out
 
     return pred.astype(np.int32)

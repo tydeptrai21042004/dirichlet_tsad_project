@@ -29,6 +29,14 @@ def main() -> None:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--window-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--alert-budget", type=float, default=0.005)
+    parser.add_argument("--train-fraction", type=float, default=0.30)
+    parser.add_argument("--threshold-warmup", type=int, default=-1)
+    parser.add_argument("--persistence", type=int, default=3)
+    parser.add_argument("--refractory", type=int, default=0)
+    parser.add_argument("--bridge-gap", type=int, default=0)
+    parser.add_argument("--if-contamination", type=float, default=0.01)
+    parser.add_argument("--force-target-only", action="store_true")
     args = parser.parse_args()
 
     data_dir = resolve_data_dir(args.data_dir)
@@ -52,9 +60,25 @@ def main() -> None:
         str(args.epochs),
         "--device",
         args.device,
+        "--alert-budget",
+        str(args.alert_budget),
+        "--train-fraction",
+        str(args.train_fraction),
+        "--threshold-warmup",
+        str(args.threshold_warmup),
+        "--persistence",
+        str(args.persistence),
+        "--refractory",
+        str(args.refractory),
+        "--bridge-gap",
+        str(args.bridge_gap),
+        "--if-contamination",
+        str(args.if_contamination),
         "--methods",
         *DEFAULT_METHODS,
     ]
+    if args.force_target_only:
+        cmd.append("--force-target-only")
 
     print("[INFO] Resolved data dir :", data_dir)
     print("[INFO] Output dir        :", output_dir)

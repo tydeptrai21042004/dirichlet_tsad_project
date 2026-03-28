@@ -22,13 +22,18 @@ class PCADetector(BaseDetector):
     def _fit_impl(self, train: np.ndarray) -> None:
         windows, _, end_pos = make_windows(train, self.window_size, horizon=1, stride=1)
         self.end_positions_train_ = end_pos
-        X = windows.reshape(len(windows), -1)
+        X = windows.reshape(len(windows), -1).astype(np.float32)
+        if X.shape[0] < 2 or np.allclose(np.var(X, axis=0), 0.0):
+            self.model_ = None
+            return
         self.model_ = PCA(n_components=self.n_components, svd_solver="full", random_state=42)
         self.model_.fit(X)
 
     def _score_impl(self, series: np.ndarray) -> np.ndarray:
         windows, _, end_pos = make_windows(series, self.window_size, horizon=1, stride=1)
-        X = windows.reshape(len(windows), -1)
+        X = windows.reshape(len(windows), -1).astype(np.float32)
+        if self.model_ is None:
+            return np.zeros(len(series), dtype=np.float32)
         recon = self.model_.inverse_transform(self.model_.transform(X))
         errs = np.mean((X - recon) ** 2, axis=1)
         scores = scatter_window_scores(errs, end_pos, len(series), horizon=1)
