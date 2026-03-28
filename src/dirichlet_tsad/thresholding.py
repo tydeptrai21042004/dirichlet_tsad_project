@@ -16,8 +16,9 @@ ThresholdMode = Literal[
 class ThresholdConfig:
     mode: ThresholdMode = "alert_budget_under"
     q: float = 0.995
-    beta: float = 0.005
+    beta: float = 0.10
     train_fraction: float = 0.30
+    warmup: int = 0  # ignore unstable first scores during calibration
 
 
 def choose_threshold(scores: np.ndarray, config: ThresholdConfig) -> float:
@@ -25,8 +26,16 @@ def choose_threshold(scores: np.ndarray, config: ThresholdConfig) -> float:
     scores = scores[np.isfinite(scores)]
     if len(scores) == 0:
         return 0.0
-    n = max(1, int(len(scores) * config.train_fraction))
-    subset = scores[:n]
+
+    end = max(1, int(len(scores) * config.train_fraction))
+    start = min(max(int(config.warmup), 0), max(end - 1, 0))
+
+    subset = scores[start:end]
+    if len(subset) == 0:
+        subset = scores[:end]
+    if len(subset) == 0:
+        return 0.0
+
     if config.mode == "fixed_quantile":
         return float(np.quantile(subset, config.q))
 
@@ -34,16 +43,32 @@ def choose_threshold(scores: np.ndarray, config: ThresholdConfig) -> float:
     if len(unique_scores) == 1:
         return float(unique_scores[0])
 
-    rates = np.asarray([(subset > thr).mean() for thr in unique_scores])
+    # rates decrease as threshold increases
+    rates = np.asarray([(subset > thr).mean() for thr in unique_scores], dtype=np.float32)
+
     if config.mode == "alert_budget_under":
         valid = np.where(rates <= config.beta)[0]
         if len(valid) == 0:
             return float(unique_scores[-1])
         return float(unique_scores[valid[0]])
+
     if config.mode == "alert_budget_closest":
         idx = int(np.argmin(np.abs(rates - config.beta)))
         return float(unique_scores[idx])
+
     raise ValueError(f"Unsupported threshold mode: {config.mode}")
+
+
+def _find_runs(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(x, dtype=np.int32)
+    if len(x) == 0:
+        return np.array([], dtype=int), np.array([], dtype=int)
+
+    padded = np.pad(x, (1, 1), mode="constant")
+    d = np.diff(padded)
+    starts = np.where(d == 1)[0]
+    ends = np.where(d == -1)[0] - 1
+    return starts, ends
 
 
 def apply_postprocessing(
@@ -51,32 +76,33 @@ def apply_postprocessing(
     persistence: int = 1,
     refractory: int = 0,
 ) -> np.ndarray:
-    pred = np.asarray(pred).astype(np.int32)
+    pred = np.asarray(pred, dtype=np.int32).copy()
     n = len(pred)
+    if n == 0:
+        return pred
+
+    # Step 1: remove short positive runs
     if persistence > 1:
+        starts, ends = _find_runs(pred)
         out = np.zeros(n, dtype=np.int32)
-        run = 0
-        for i in range(n):
-            if pred[i]:
-                run += 1
-            else:
-                run = 0
-            if run >= persistence:
-                out[i - persistence + 1 : i + 1] = 1
+        for s, e in zip(starts, ends):
+            if (e - s + 1) >= persistence:
+                out[s : e + 1] = 1
         pred = out
+
+    # Step 2: merge nearby runs if the gap is small
     if refractory > 0:
-        out = pred.copy()
-        cooldown = 0
-        active = False
-        for i in range(n):
-            if cooldown > 0:
-                if out[i] == 1:
-                    out[i] = 0
-                cooldown -= 1
-            if out[i] == 1 and not active:
-                cooldown = refractory
-                active = True
-            elif out[i] == 0:
-                active = False
-        pred = out
-    return pred
+        starts, ends = _find_runs(pred)
+        if len(starts) > 1:
+            out = pred.copy()
+            cur_s, cur_e = starts[0], ends[0]
+            for s, e in zip(starts[1:], ends[1:]):
+                gap = s - cur_e - 1
+                if gap <= refractory:
+                    out[cur_e + 1 : s] = 1
+                    cur_e = e
+                else:
+                    cur_s, cur_e = s, e
+            pred = out
+
+    return pred.astype(np.int32)
