@@ -20,6 +20,9 @@ class DirichletResidualDetector(BaseDetector):
         kappa: float = 0.5,
         target_index: int = 0,
         normalize: bool = True,
+        use_residual_gate: bool = True,
+        residual_gate_window: int = 5,
+        residual_gate_quantile: float = 0.75,
     ):
         super().__init__(normalize=normalize)
         self.alpha = float(alpha)
@@ -30,6 +33,10 @@ class DirichletResidualDetector(BaseDetector):
         self.kappa = float(kappa)
         self.target_index = int(target_index)
 
+        self.use_residual_gate = bool(use_residual_gate)
+        self.residual_gate_window = int(residual_gate_window)
+        self.residual_gate_quantile = float(residual_gate_quantile)
+
     def _fit_impl(self, train: np.ndarray) -> None:
         if self.lag_weights is None:
             weights = np.asarray([1.0 / l for l in self.lags], dtype=np.float32)
@@ -39,6 +46,17 @@ class DirichletResidualDetector(BaseDetector):
             if len(weights) != len(self.lags):
                 raise ValueError("lag_weights must have same length as lags")
             self.weights_ = weights / weights.sum()
+
+        # Fit a residual gate on train only
+        self.residual_gate_threshold_ = 0.0
+        if self.use_residual_gate:
+            x = train[:, self.target_index].astype(np.float32)
+            bg = self._dirichlet_background(x)
+            residual = np.abs(x - bg)
+            env = self._residual_envelope(residual)
+            self.residual_gate_threshold_ = float(
+                np.quantile(env, self.residual_gate_quantile)
+            )
 
     def _dirichlet_background(self, x: np.ndarray) -> np.ndarray:
         n = len(x)
@@ -64,6 +82,14 @@ class DirichletResidualDetector(BaseDetector):
             z[i] = (x[i] - med) / scale
 
         return z
+
+    def _residual_envelope(self, residual_abs: np.ndarray) -> np.ndarray:
+        w = max(int(self.residual_gate_window), 1)
+        if w == 1:
+            return residual_abs.astype(np.float32)
+        kernel = np.ones(w, dtype=np.float32) / float(w)
+        env = np.convolve(residual_abs.astype(np.float32), kernel, mode="same")
+        return env.astype(np.float32)
 
     def _score_impl(self, series: np.ndarray) -> np.ndarray:
         x = series[:, self.target_index].astype(np.float32)
@@ -91,6 +117,20 @@ class DirichletResidualDetector(BaseDetector):
 
         a *= self.kappa
 
-        # Rolling median-MAD normalization, threshold later on |z_t|
-        z = self._rolling_median_mad_z(a, window=self.norm_window)
-        return np.abs(z).astype(np.float32)
+        # Robust rolling normalization
+        z = np.abs(self._rolling_median_mad_z(a, window=self.norm_window))
+
+        # Make boundaries stricter because zero-padding can create spurious edge spikes
+        edge = max(self.lags) if len(self.lags) > 0 else 1
+        if edge > 0:
+            z[:edge] = 0.0
+            z[-edge:] = 0.0
+
+        # Residual confirmation gate to reduce false positives
+        if self.use_residual_gate:
+            env = self._residual_envelope(np.abs(residual))
+            thr = max(float(getattr(self, "residual_gate_threshold_", 0.0)), 1e-6)
+            gate = np.clip(env / thr, 0.0, 1.0)
+            z = z * gate
+
+        return z.astype(np.float32)
