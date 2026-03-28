@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
 from scipy.fft import dst, idst
 
-from ..utils import causal_moving_average, rolling_mad
 from .base import BaseDetector
 
 
@@ -24,7 +23,8 @@ class DirichletResidualDetector(BaseDetector):
     ):
         super().__init__(normalize=normalize)
         self.alpha = float(alpha)
-        self.lags = tuple(sorted(set(int(l) for l in lags if int(l) > 0)))
+        clean_lags = tuple(sorted(set(int(l) for l in lags if int(l) > 0)))
+        self.lags = clean_lags if len(clean_lags) > 0 else (1,)
         self.lag_weights = lag_weights
         self.norm_window = int(norm_window)
         self.kappa = float(kappa)
@@ -32,8 +32,8 @@ class DirichletResidualDetector(BaseDetector):
 
     def _fit_impl(self, train: np.ndarray) -> None:
         if self.lag_weights is None:
-            self.weights_ = np.asarray([1.0 / l for l in self.lags], dtype=np.float32)
-            self.weights_ = self.weights_ / self.weights_.sum()
+            weights = np.asarray([1.0 / l for l in self.lags], dtype=np.float32)
+            self.weights_ = weights / weights.sum()
         else:
             weights = np.asarray(self.lag_weights, dtype=np.float32)
             if len(weights) != len(self.lags):
@@ -49,20 +49,48 @@ class DirichletResidualDetector(BaseDetector):
         bg = idst(coeffs * mu, type=1, norm="ortho")
         return bg.astype(np.float32)
 
+    @staticmethod
+    def _rolling_median_mad_z(x: np.ndarray, window: int, eps: float = 1e-6) -> np.ndarray:
+        n = len(x)
+        z = np.zeros(n, dtype=np.float32)
+        window = max(int(window), 1)
+
+        for i in range(n):
+            s = max(0, i - window + 1)
+            seg = x[s : i + 1]
+            med = float(np.median(seg))
+            mad = float(np.median(np.abs(seg - med)))
+            scale = 1.4826 * max(mad, eps)
+            z[i] = (x[i] - med) / scale
+
+        return z
+
     def _score_impl(self, series: np.ndarray) -> np.ndarray:
         x = series[:, self.target_index].astype(np.float32)
         bg = self._dirichlet_background(x)
         residual = x - bg
 
-        score = np.zeros_like(residual)
-        for lag, weight in zip(self.lags, self.weights_):
-            diff = np.zeros_like(residual)
-            diff[lag:] = residual[lag:] - residual[:-lag]
-            anti = np.abs(diff)
-            sym = np.zeros_like(residual)
-            sym[lag:] = np.abs(residual[lag:] + residual[:-lag])
-            score += float(weight) * (anti + self.kappa * sym)
+        # Paper-like antisymmetric score:
+        # a_t = kappa * sum_l w_l * (r_{t+l} - r_{t-l})
+        a = np.zeros_like(residual, dtype=np.float32)
 
-        norm = rolling_mad(score, window=self.norm_window)
-        z = score / norm
-        return np.maximum(z, 0.0).astype(np.float32)
+        for lag, weight in zip(self.lags, self.weights_):
+            if lag <= 0 or lag >= len(residual):
+                continue
+
+            forward = np.zeros_like(residual, dtype=np.float32)
+            backward = np.zeros_like(residual, dtype=np.float32)
+
+            # forward[t] = r_{t+lag}
+            forward[:-lag] = residual[lag:]
+
+            # backward[t] = r_{t-lag}
+            backward[lag:] = residual[:-lag]
+
+            a += float(weight) * (forward - backward)
+
+        a *= self.kappa
+
+        # Rolling median-MAD normalization, threshold later on |z_t|
+        z = self._rolling_median_mad_z(a, window=self.norm_window)
+        return np.abs(z).astype(np.float32)
